@@ -37,7 +37,17 @@ def test_build_worker_config_shapes_values():
         "auto_switch_server": True,
         "afk_enabled": True,
         "farming_path": None,
+        "avoid_death_spot": True,
     }
+
+
+def test_build_worker_config_with_avoid_death_spot_false():
+    cfg = gui_app.build_worker_config(
+        map_name="desert", location=(5, 5), area=[(1, 1), (9, 9)], duration=60,
+        short_limit=2, enemy_ai=False, auto_switch=False, afk=False,
+        avoid_death_spot=False,
+    )
+    assert cfg["avoid_death_spot"] is False
 
 
 def test_build_worker_config_with_farming_path():

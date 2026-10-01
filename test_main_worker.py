@@ -31,6 +31,26 @@ def test_apply_worker_config_maps_keys(monkeypatch):
     assert w["enemy_ai_enabled"] is False
     assert w["auto_switch_server"] is False
     assert w["farming_path"] is None
+    assert w["avoid_death_spot"] is True    # 默认开(死亡后避让)
+
+
+def test_apply_worker_config_avoid_death_spot_false(monkeypatch):
+    # config 显式关掉避让 → 摊平为 False.
+    applied = {}
+    monkeypatch.setattr(main, "apply_map", lambda name: applied.setdefault("map", name))
+    cfg = {
+        "map": "ocean",
+        "location": [11, 22],
+        "farming_area": [[1, 2], [3, 4]],
+        "farming_duration": 120,
+        "consecutive_short_round_limit": 5,
+        "enemy_ai_enabled": False,
+        "auto_switch_server": False,
+        "afk_enabled": True,
+        "avoid_death_spot": False,
+    }
+    w = main._apply_worker_config(cfg)
+    assert w["avoid_death_spot"] is False
 
 
 def test_apply_worker_config_farming_path_overrides_location_and_clamps(monkeypatch):
@@ -144,31 +164,6 @@ def test_auto_farming_accepts_enemy_ai_enabled_kwarg():
     assert "farming_path" in sig.parameters   # 固定路径刷怪的新参数(默认 None = 区域模式)
 
 
-def _stub_auto_farming_env(monkeypatch, death_calls_to_false=2):
-    """把 auto_farming 主循环的实机依赖打桩掉. on_death_screen 前 N 次返回 False,
-    再下一次抛 KeyboardInterrupt 让循环退出(不依赖刷满 duration)."""
-    import types as _t
-    calls = {"n": 0}
-
-    def fake_death():
-        calls["n"] += 1
-        if calls["n"] <= death_calls_to_false:
-            return False
-        raise KeyboardInterrupt()
-
-    monkeypatch.setattr(main.afk_watch, "poll_afk_pause", lambda: False)
-    monkeypatch.setattr(main, "_garden_escape_needed", lambda: False)
-    monkeypatch.setattr(main, "on_death_screen", fake_death)
-    monkeypatch.setattr(main, "on_start_screen", lambda: False)
-    monkeypatch.setattr(main, "get_player_position", lambda: (5, 5))
-    monkeypatch.setattr(main, "if_in_area", lambda *a, **k: True, raising=False)
-    monkeypatch.setattr(main, "_maybe_scan_enemies",
-                        lambda *a, **k: (("wander", None), [], 0.0, False))
-    monkeypatch.setattr(main, "overlay",
-                        _t.SimpleNamespace(update=lambda **k: None), raising=False)
-    return calls
-
-
 def test_auto_farming_fixed_path_walks_in_order_then_loops(monkeypatch):
     # 固定路径: 依次走 path 点; 到终点(index=len-1)后循环回起点(index=0).
     targets = []
@@ -200,6 +195,124 @@ def test_auto_farming_fixed_path_does_not_advance_on_stuck(monkeypatch):
     # 第一个点卡住(不推进)→ 重试同一个点走成功 → 再走到第二个点.
     assert targets == [(10, 10), (10, 10), (20, 20)]
     assert escapes == [1]
+
+
+def _stub_auto_farming_env(monkeypatch, death_calls_to_false=2, pos=(5, 5)):
+    """把 auto_farming 主循环的实机依赖打桩掉. on_death_screen 前 N 次返回 False,
+    再下一次抛 KeyboardInterrupt 让循环退出(不依赖刷满 duration)."""
+    import types as _t
+    calls = {"n": 0}
+
+    def fake_death():
+        calls["n"] += 1
+        if calls["n"] <= death_calls_to_false:
+            return False
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(main.afk_watch, "poll_afk_pause", lambda: False)
+    monkeypatch.setattr(main, "_garden_escape_needed", lambda: False)
+    monkeypatch.setattr(main, "on_death_screen", fake_death)
+    monkeypatch.setattr(main, "on_start_screen", lambda: False)
+    monkeypatch.setattr(main, "get_player_position", lambda: pos)
+    monkeypatch.setattr(main, "if_in_area", lambda *a, **k: True, raising=False)
+    monkeypatch.setattr(main, "_maybe_scan_enemies",
+                        lambda *a, **k: (("wander", None), [], 0.0, False))
+    monkeypatch.setattr(main, "overlay",
+                        _t.SimpleNamespace(update=lambda **k: None), raising=False)
+    return calls
+
+
+def test_auto_farming_accepts_avoid_death_spot_kwarg():
+    sig = inspect.signature(main.auto_farming)
+    assert "avoid_death_spot" in sig.parameters
+    assert sig.parameters["avoid_death_spot"].kind == inspect.Parameter.KEYWORD_ONLY
+
+
+def test_auto_farming_path_mode_skips_points_near_death_spot(monkeypatch):
+    # 固定路径 + 死亡点避让: 前 DEATH_AVOID_FIRST_MOVES 次移动跳过死亡点附近的
+    # 路径点(10,10)距死亡点(12,12) ≤ 半径8, 被跳过; (20,20) 不跳过.
+    targets = []
+    monkeypatch.setattr(main, "move_to_position",
+                        lambda cur, tgt, **k: (targets.append(tgt), True)[1])
+    _stub_auto_farming_env(monkeypatch, death_calls_to_false=6)
+    path = [(10, 10), (20, 20), (30, 30)]
+    with pytest.raises(KeyboardInterrupt):
+        main.auto_farming([(0, 0), (9, 9)], duration=300,
+                          enemy_ai_enabled=False, farming_path=path,
+                          avoid_death_spot=(12, 12))
+    # (10,10) 距死亡点 sqrt(8)≈2.8 ≤ 8 → 每次轮到它都被跳过. 避让期 3 次移动:
+    # 第 1 次 (20,20); 第 2 次 (30,30); 第 3 次轮到 (10,10) 仍被跳过 → (20,20).
+    assert targets == [(20, 20), (30, 30), (20, 20)]
+
+
+def test_auto_farming_area_mode_uses_avoiding_picker_first_moves(monkeypatch):
+    # 区域模式 + 死亡点避让: 前 3 次移动用 _random_point_avoiding, 之后回退普通
+    # random_walkable_point.
+    called = {"avoid": 0, "plain": 0}
+    monkeypatch.setattr(main, "move_to_position",
+                        lambda cur, tgt, **k: (called, True)[1])
+
+    def fake_avoid(*a, **k):
+        called["avoid"] += 1
+        return (7, 7)
+
+    def fake_plain(*a, **k):
+        called["plain"] += 1
+        return (8, 8)
+
+    monkeypatch.setattr(main, "_random_point_avoiding", fake_avoid)
+    monkeypatch.setattr(main, "random_walkable_point", fake_plain)
+    _stub_auto_farming_env(monkeypatch, death_calls_to_false=10)
+    with pytest.raises(KeyboardInterrupt):
+        main.auto_farming([(0, 0), (9, 9)], duration=300,
+                          enemy_ai_enabled=False, avoid_death_spot=(5, 5))
+    # 前 3 次移动避让, 之后普通随机.
+    assert called["avoid"] == 3
+    assert called["plain"] > 0
+
+
+def test_auto_farming_without_avoid_spot_uses_plain_picker(monkeypatch):
+    # 不传 avoid_death_spot → 行为与旧版一致: 只用普通随机取点.
+    called = {"plain": 0}
+    monkeypatch.setattr(main, "move_to_position",
+                        lambda cur, tgt, **k: (called, True)[1])
+    monkeypatch.setattr(main, "random_walkable_point",
+                        lambda *a, **k: (called.__setitem__("plain", called["plain"] + 1), (8, 8))[1])
+    _stub_auto_farming_env(monkeypatch, death_calls_to_false=6)
+    with pytest.raises(KeyboardInterrupt):
+        main.auto_farming([(0, 0), (9, 9)], duration=300, enemy_ai_enabled=False)
+    assert called["plain"] > 0
+    assert called["plain"] == 3   # 3 次移动(与 old test 一致)
+
+
+def test_random_point_avoiding_retries_points_near_avoid_spot(monkeypatch):
+    # 采样点距死亡点太近 → 重试; 全在半径内 → 兜底返回普通随机点.
+    seq = iter([(5, 5), (20, 20)])   # (5,5) 距 (6,6) ≤ 8, 被拒; (20,20) 接受
+    monkeypatch.setattr(main, "random_walkable_point", lambda *a, **k: next(seq))
+    got = main._random_point_avoiding([(0, 0), (30, 30)], None, (6, 6), 8)
+    assert got == (20, 20)
+
+
+def test_random_point_avoiding_falls_back_when_all_near(monkeypatch):
+    # 整个区域都在死亡点半径内 → max_tries 次都被拒, 兜底返回(不卡死).
+    calls = {"n": 0}
+    monkeypatch.setattr(main, "random_walkable_point",
+                        lambda *a, **k: (calls.__setitem__("n", calls["n"] + 1), (5, 5))[1])
+    got = main._random_point_avoiding([(0, 0), (30, 30)], None, (6, 6), 8, max_tries=4)
+    assert got == (5, 5)
+    assert calls["n"] == 5   # 4 次拒绝 + 1 次兜底
+
+
+def test_auto_farming_reports_death_spot_when_breaks(monkeypatch):
+    # 死亡(未刷满)退出 → auto_farming 把死亡前最后存活位置写进 _avoid_death_spot.
+    monkeypatch.setattr(main, "_avoid_death_spot", None, raising=False)
+    _stub_auto_farming_env(monkeypatch, death_calls_to_false=1, pos=(5, 6))
+    monkeypatch.setattr(main, "move_to_position",
+                        lambda cur, tgt, **k: "in_game_dead")
+    result = main.auto_farming([(0, 0), (9, 9)], duration=300, enemy_ai_enabled=False)
+    # move_to_position 返回 in_game_dead → break 分支, 正常返回(不抛异常), 且不是 timeout.
+    assert result is False
+    assert main._avoid_death_spot == (5, 6)   # 死亡前最后存活位置(采样在死亡检测前)
 
 
 def test_worker_graceful_exit_resets_keyboard_then_exits(monkeypatch):
@@ -242,6 +355,7 @@ def test_run_worker_does_not_start_florr_auto_afk(monkeypatch):
         "short_round_limit": 2,
         "enemy_ai_enabled": False,
         "auto_switch_server": False,
+        "avoid_death_spot": True,
     })
     # 主循环体的第一个调用 —— 在这里掐断, 前面的 setup 已经全跑完了.
     monkeypatch.setattr(main, "on_death_screen",

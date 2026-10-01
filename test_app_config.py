@@ -63,6 +63,15 @@ def test_farming_path_default_is_none():
     assert app_config.DEFAULTS["farming_path"] is None
 
 
+def test_avoid_death_spot_default_true_and_validated(cfg_path):
+    # 死亡后避让默认开; bool 校验同其他开关.
+    assert app_config.DEFAULTS["avoid_death_spot"] is True
+    cfg_path.write_text(json.dumps({"avoid_death_spot": False}), encoding="utf-8")
+    assert app_config.load_config()["avoid_death_spot"] is False
+    cfg_path.write_text(json.dumps({"avoid_death_spot": "yes"}), encoding="utf-8")
+    assert app_config.load_config()["avoid_death_spot"] is True   # 非法回落默认
+
+
 @pytest.mark.parametrize("bad", [
     {"farming_path": [[5, 5]]},          # 单点没意义
     {"farming_path": [[1, 2, 3], [4, 5, 6]]},   # 不是 int 对

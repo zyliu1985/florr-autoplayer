@@ -73,6 +73,11 @@ TELEPORT_CHECK_EVERY = 10          # move_to_position 每 N 个 tick 查一次 g
 TELEPORT_RECOVER_TIMEOUT = 15      # 等画面恢复的超时(秒)
 PORTAL_WALK_SECONDS = 8            # 走到传送门后等进门/顶门的最长时间(秒)
 
+# 死亡后避让: 上一轮死亡且没换服 → 下一轮前几次移动避开死亡位置附近(minimap 像素).
+DEATH_AVOID_RADIUS = 8             # 距死亡点多近算"危险区域"
+DEATH_AVOID_FIRST_MOVES = 3        # 避让只作用于下一轮的前几次移动(之后恢复正常)
+_avoid_death_spot = None           # 模块级: 上一轮死亡位置(未换服时), 下一轮避让用
+
 # ===== 脱困 v2 (沿通道走向 + 验证换向 + 卡点封堵) =====
 # 总开关: 置 False 即整体回退到旧版"垂直墙面单发斥力"脱困(_run_escape_v1), 并停止
 # 记录/封堵卡点. 新逻辑若在实机翻车, 把这里改成 False 即可回到改动前的行为.
@@ -838,6 +843,20 @@ def random_walkable_point(area, binary_map, max_tries=20):
     return random.randint(x1, x2), random.randint(y1, y2)
 
 
+def _random_point_avoiding(area, binary_map, avoid_pos, radius, max_tries=20):
+    """在区域内随机采一个可走点, 且距离 avoid_pos 超过 radius(死亡点避让).
+
+    复用 random_walkable_point 的可走采样 + 一层"离死亡点远"的拒绝采样:
+    采到的点距 avoid_pos 太近就重来, max_tries 次还不行就退回普通随机点
+    (兜底不卡死 —— 极端情况整个区域都在死亡点半径内时, 硬要避开反而会死循环).
+    """
+    for _ in range(max_tries):
+        x, y = random_walkable_point(area, binary_map)
+        if distance((x, y), avoid_pos) > radius:
+            return x, y
+    return random_walkable_point(area, binary_map)
+
+
 def _maybe_scan_enemies(enemy_ai_enabled, now, last_enemy_scan, prev_decision, prev_detections):
     """索敌节流 + 总开关. 返回 (decision, detections, last_enemy_scan, scanned).
 
@@ -982,12 +1001,16 @@ def ensure_zoom_for_rarity(enemy_ai_enabled):
 
 
 def auto_farming(farming_area, duration=300, *, enemy_ai_enabled=True,
-                 farming_path=None):
+                 farming_path=None, avoid_death_spot=None):
     """自动刷怪逻辑（依赖一直攻击按钮）—— 连续走动, 不停下站桩.
 
     区域模式(farming_path=None, 默认): 在 farming_area 内随机选可走点走动.
     固定路径模式(farming_path 给定时): 依次走路径点, 到终点后循环回起点
     (不走反向折返). 两种模式都不主动暂停, 靠外部"一直攻击"按钮持续输出.
+
+    avoid_death_spot 给定时: 前 DEATH_AVOID_FIRST_MOVES 次移动避开该点附近
+    (区域=随机点过滤, 路径=跳过死亡点附近的路径点). 死亡位置由 run_worker
+    轮末写入模块级 _avoid_death_spot, 本函数只在取点时消费, 不修改它.
     """
     x1, y1 = farming_area[0]
     x2, y2 = farming_area[1]
@@ -1013,6 +1036,8 @@ def auto_farming(farming_area, duration=300, *, enemy_ai_enabled=True,
     start_time = time.time()
     move_count = 0
     exit_reason = "timeout"
+    last_alive_pos = None      # 死亡前最后确认是存活画面时采到的位置(给 run_worker 上报)
+    avoid_remaining = DEATH_AVOID_FIRST_MOVES if avoid_death_spot else 0   # 还剩几次移动要避让
     last_enemy_scan = 0.0
     enemy_decision = ("wander", None)
     detections = []
@@ -1072,6 +1097,10 @@ def auto_farming(farming_area, duration=300, *, enemy_ai_enabled=True,
             time.sleep(1)
             mythic_latch, mythic_misses, mythic_target_pos = False, 0, None
             continue
+
+        # 走到这里说明画面既不是死亡也不是菜单 —— current_pos 是死亡前最后确认
+        # 的存活位置(死亡后小地图被盖, 再采样是假位置, 所以只在存活时更新).
+        last_alive_pos = current_pos
 
         # 检查是否还在刷怪区域 —— 只在区域随机模式有效: 固定路径模式下没有
         # "区域"语义(路径点可能超出任何单个矩形), 走到路径点本身就是在刷怪,
@@ -1144,12 +1173,24 @@ def auto_farming(farming_area, duration=300, *, enemy_ai_enabled=True,
         if farming_path:
             # 固定路径: 走下一个路径点. 到终点(最后一个点)后循环回起点 ——
             # 下个 tick 从 index 0 重新走, 不是原路折返(用户选的"循环").
+            # 避让期: 跳过死亡点附近的路径点(最多扫一圈, 防全路径都在半径内死循环).
             target = farming_path[path_index]
+            if avoid_remaining > 0:
+                for _ in range(len(farming_path)):
+                    if distance(target, avoid_death_spot) > DEATH_AVOID_RADIUS:
+                        break
+                    path_index = (path_index + 1) % len(farming_path)
+                    target = farming_path[path_index]
             print(f"🚶 沿路径移动到 {target} (点 {path_index + 1}/{len(farming_path)})")
             overlay.update(state="刷怪中", pos=current_pos, target=target,
                            message=f"固定路径 (点 {path_index + 1}/{len(farming_path)})")
         else:
-            random_x, random_y = random_walkable_point(farming_area, binary_map)
+            # 区域模式: 避让期从死亡点半径外的点里随机采, 平时直接随机.
+            if avoid_remaining > 0:
+                random_x, random_y = _random_point_avoiding(
+                    farming_area, binary_map, avoid_death_spot, DEATH_AVOID_RADIUS)
+            else:
+                random_x, random_y = random_walkable_point(farming_area, binary_map)
             target = (random_x, random_y)
             print(f"🚶 移动到 ({random_x}, {random_y})")
             overlay.update(state="刷怪中", pos=current_pos, target=target,
@@ -1177,6 +1218,10 @@ def auto_farming(farming_area, duration=300, *, enemy_ai_enabled=True,
         else:
             # 只有真正走到点上才计入移动次数, "受阻"那次不算.
             move_count += 1
+            # 避让计数: 只在实际发起一次移动(到达/成功)后递减 —— 路径模式跳过
+            # 死亡点不算一次移动, 卡住重试也不消耗避让次数.
+            if avoid_remaining > 0:
+                avoid_remaining -= 1
             # 固定路径: 走到当前点才算数, 推进到下一个; 到终点就循环回起点.
             if farming_path:
                 path_index = (path_index + 1) % len(farming_path)
@@ -1207,6 +1252,11 @@ def auto_farming(farming_area, duration=300, *, enemy_ai_enabled=True,
     # 是不是刷满了整个duration —— 给调用方(主循环)判断"这轮算不算刷够时长"用,
     # 不刷满(死亡/被踢/卡死放弃)的连续出现太多次, 说明这个服务器可能有问题
     # (比如刷怪区域被占、或者哪里持续卡关), 值得换个服务器而不是死磕.
+    if exit_reason != "timeout" and last_alive_pos is not None:
+        # 本轮提前退出(死亡/菜单/卡死放弃) → 把死亡前最后位置上报给 run_worker,
+        # 它会在"没换服"时用这个位置让下一轮避让. 刷满(正常完成)不记.
+        global _avoid_death_spot
+        _avoid_death_spot = last_alive_pos
     return exit_reason == "timeout"
 
 
@@ -1234,6 +1284,7 @@ def _apply_worker_config(cfg):
         "short_round_limit": cfg["consecutive_short_round_limit"],
         "enemy_ai_enabled": cfg["enemy_ai_enabled"],
         "auto_switch_server": cfg["auto_switch_server"],
+        "avoid_death_spot": bool(cfg.get("avoid_death_spot", True)),
     }
 
 
@@ -1281,6 +1332,7 @@ def run_worker(cfg):
     farming_path = w["farming_path"]
     farming_duration = w["farming_duration"]
     CONSECUTIVE_SHORT_ROUND_LIMIT = w["short_round_limit"]
+    avoid_death = w["avoid_death_spot"]
 
     # 索敌 AI 只有 desert 一张图有 YOLO 模型, 而且那个 .pt 不随仓库发布(第三方
     # pickle 权重, 见 README), 得用户自己放进 models/. 开着但用不了的话
@@ -1329,7 +1381,8 @@ def run_worker(cfg):
                 print("⚠️ 视角未调到位, 本轮稀有度识别可能不准 (Mythic 锁定可能不触发)")
             auto_farming(farming_area, farming_duration,
                          enemy_ai_enabled=w["enemy_ai_enabled"],
-                         farming_path=farming_path)
+                         farming_path=farming_path,
+                         avoid_death_spot=_avoid_death_spot if avoid_death else None)
         else:
             print("❌ 本轮未能到达目标区域")
             overlay.update(message="本轮未能到达目标区域")
@@ -1358,6 +1411,11 @@ def run_worker(cfg):
             except Exception as e:
                 print(f"⚠️ 换服务器失败, 先用当前服务器继续刷 (下轮再重试): {e}")
                 overlay.update(message=f"换服务器失败(下轮重试): {e}")
+            # 换了服务器 → 上一轮的死亡位置在另一台服务器上没意义, 清掉.
+            _avoid_death_spot = None
+        elif completed_full_duration:
+            # 刷满了(正常存活一整轮) → 没有死亡位置要避让.
+            _avoid_death_spot = None
 
 
 def _worker_graceful_exit(signum, frame):

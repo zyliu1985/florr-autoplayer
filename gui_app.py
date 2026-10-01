@@ -34,9 +34,11 @@ def worker_command():
 
 
 def build_worker_config(*, map_name, location, area, duration, short_limit,
-                        enemy_ai, auto_switch, afk, farming_path=None):
+                        enemy_ai, auto_switch, afk, farming_path=None,
+                        avoid_death_spot=True):
     """界面上的值 -> app_config schema 的 dict. 坐标统一转成 list(JSON 里没有 tuple).
-    farming_path 给定时(固定路径模式)写进 config, 否则为 None(区域模式)."""
+    farming_path 给定时(固定路径模式)写进 config, 否则为 None(区域模式).
+    avoid_death_spot: 死亡后避让开关, 默认开."""
     cfg = {
         "map": map_name,
         "location": [int(location[0]), int(location[1])],
@@ -45,6 +47,7 @@ def build_worker_config(*, map_name, location, area, duration, short_limit,
         "enemy_ai_enabled": bool(enemy_ai),
         "auto_switch_server": bool(auto_switch),
         "afk_enabled": bool(afk),
+        "avoid_death_spot": bool(avoid_death_spot),
     }
     # 固定路径模式: area 是 None, 写默认区域占位(config schema 要 farming_area 键).
     if area:
@@ -204,6 +207,11 @@ class App(ctk.CTk):
         self.autoswitch_check.pack(anchor="w", pady=6)
         if self._cfg["auto_switch_server"]:
             self.autoswitch_check.select()
+        self.avoid_death_check = ctk.CTkCheckBox(
+            right, text="死亡后避让死亡区域（没换服时）")
+        self.avoid_death_check.pack(anchor="w", pady=6)
+        if self._cfg.get("avoid_death_spot", True):
+            self.avoid_death_check.select()
 
         self.log_box = ctk.CTkTextbox(right, font=("Menlo", 11), state="disabled")
         self.log_box.pack(fill="both", expand=True, pady=(8, 0))
@@ -289,6 +297,7 @@ class App(ctk.CTk):
             enemy_ai=bool(self.enemy_switch.get()),
             auto_switch=bool(self.autoswitch_check.get()),
             afk=bool(self.afk_switch.get()),
+            avoid_death_spot=bool(self.avoid_death_check.get()),
             mode=self._mode,
             # 只有固定路径模式才把路径写进 config —— 否则切回随机区域后 _path
             # 残留上次画的路径, config 里 farming_path 非空, worker 还是按路径刷.
