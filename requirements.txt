@@ -1,0 +1,18 @@
+# florr-auto-pathing runtime deps.
+# Pin rationale lives in the project memory (venv-setup-deps); keep in sync if you touch this file.
+opencv-python<5        # <5 pinned: opencv-python 5.x demands numpy>=2, conflicts with torch below
+numpy<2                # torch==2.2.2-class wheels were built against NumPy 1.x
+pyautogui
+pillow                 # pyautogui's screenshot() silently needs this via pyscreeze
+pyobjc-framework-Cocoa; sys_platform == "darwin"   # overlay.py's macOS PyObjC window (unused on Windows)
+torch<2.3
+ultralytics            # YOLO inference for enemy_detect.py
+websocket-client       # cdp_bridge.py's Chrome DevTools Protocol client
+certifi                # server_lookup.py's explicit SSLContext (needed on Windows, see memory)
+customtkinter          # gui_app.py dark-theme GUI (pure Python; pulls darkdetect, packaging)
+
+# --- packaging only, not needed to just run main.py ---
+pyinstaller
+
+# --- dev only ---
+pytest
