@@ -1325,6 +1325,10 @@ def run_worker(cfg):
     #     又给它拉回去.
     global overlay
     overlay = create_overlay()
+    # run_worker 里对 _avoid_death_spot 既读又写(轮末清空), 必须先声明 global,
+    # 否则函数内任何赋值都会把它变成局部变量, 读它(第一轮传参)就 UnboundLocalError.
+    global _avoid_death_spot
+    _avoid_death_spot = None   # 进程启动: 没有上一轮死亡位置可避让
 
     w = _apply_worker_config(cfg)
     location = w["location"]
