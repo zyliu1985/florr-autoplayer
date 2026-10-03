@@ -1411,15 +1411,21 @@ def run_worker(cfg):
             try:
                 switch_server()
                 consecutive_short_rounds = 0
+                # 换服成功 → 上一轮的死亡位置在另一台服务器上没意义, 清掉.
+                _avoid_death_spot = None
                 time.sleep(2)
             except Exception as e:
                 print(f"⚠️ 换服务器失败, 先用当前服务器继续刷 (下轮再重试): {e}")
                 overlay.update(message=f"换服务器失败(下轮重试): {e}")
-            # 换了服务器 → 上一轮的死亡位置在另一台服务器上没意义, 清掉.
-            _avoid_death_spot = None
+                # 换服失败 → 人还在同一台服务器, 上一轮死亡位置仍有效,
+                # 不清 _avoid_death_spot, 下一轮继续避让(这正是"没换服就避让").
         elif completed_full_duration:
             # 刷满了(正常存活一整轮) → 没有死亡位置要避让.
             _avoid_death_spot = None
+        # action == "none"(且未刷满, 即本次死亡但没换服):
+        # _avoid_death_spot 保持 auto_farming 刚上报的死亡位置, 下一轮避让.
+        # 这覆盖"开了自动换服但本次没触发"(如: 换服开关开着但连续短局数还
+        # 没到 limit)和"没开自动换服"两种情况 —— 只要没真换服就避让.
 
 
 def _worker_graceful_exit(signum, frame):

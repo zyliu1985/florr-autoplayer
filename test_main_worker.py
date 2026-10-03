@@ -315,6 +315,115 @@ def test_auto_farming_reports_death_spot_when_breaks(monkeypatch):
     assert main._avoid_death_spot == (5, 6)   # 死亡前最后存活位置(采样在死亡检测前)
 
 
+class _RunWorkerStub:
+    """把 run_worker 的全部实机依赖打桩掉, 只留轮末避让/换服判定逻辑.
+
+    用法: 设置 self.auto_farming_calls 的返回序列, 每次 auto_farming 调完记录它
+    收到的 avoid_death_spot; 轮末自己维护 _avoid_death_spot(模拟 auto_farming 死亡
+    上报). 抛 KeyboardInterrupt 结束 while 循环.
+    """
+
+    def __init__(self, monkeypatch, switch_calls=None):
+        self.monkeypatch = monkeypatch
+        self.overlay = _StubOverlay()
+        self.auto_farming_calls = []      # auto_farming 收到的 avoid_death_spot
+        self.round = {"n": 0}
+        self.switch_raises = iter(switch_calls or [])
+        self.avoid_spot_after = None      # 每轮 auto_farming 之后 _avoid_death_spot 的值
+        monkeypatch.setattr(main.cdp_bridge, "is_dedicated_chrome_ready", lambda: True)
+        monkeypatch.setattr(main, "create_overlay", lambda *a, **k: self.overlay)
+        monkeypatch.setattr(main, "overlay", self.overlay, raising=False)
+        monkeypatch.setattr(main, "_apply_worker_config", lambda cfg: {
+            "location": (1, 2),
+            "farming_area": [(0, 0), (9, 9)],
+            "farming_path": None,
+            "farming_duration": 300,
+            "short_round_limit": 2,
+            "enemy_ai_enabled": False,
+            "auto_switch_server": True,
+            "avoid_death_spot": True,
+        })
+        monkeypatch.setattr(main, "lazy_theta_pathing", lambda *a, **k: True)
+        monkeypatch.setattr(main, "ensure_zoom_for_rarity", lambda *a, **k: False)
+        monkeypatch.setattr(main, "on_death_screen", lambda: False)
+        monkeypatch.setattr(main, "on_start_screen", lambda: False)
+        monkeypatch.setattr(main, "_garden_escape_needed", lambda: False)
+        monkeypatch.setattr(main, "switch_server", self._fake_switch)
+        monkeypatch.setattr(main.time, "time", lambda: 0)   # round_elapsed=0 → 未刷满
+
+    def _fake_switch(self):
+        for exc in self.switch_raises:
+            raise exc
+
+    def run(self):
+        """跑 run_worker, 在 auto_farming 第 2 次调用时结束循环(拿够两次对比)."""
+        calls = {"n": 0}
+
+        def fake_auto_farming(farming_area, duration=300, *, enemy_ai_enabled=True,
+                              farming_path=None, avoid_death_spot=None):
+            calls["n"] += 1
+            self.auto_farming_calls.append(avoid_death_spot)
+            if calls["n"] == 1:
+                # 第一轮: 模拟死亡 → 上报死亡前位置(auto_farming 的 break 分支行为).
+                main._avoid_death_spot = (30, 40)
+                return False   # 未刷满
+            raise KeyboardInterrupt()   # 第二轮到此为止, 结束 run_worker
+
+        self.monkeypatch.setattr(main, "auto_farming", fake_auto_farming)
+        try:
+            main.run_worker({})
+        except KeyboardInterrupt:
+            pass
+
+
+def test_run_worker_keeps_death_spot_when_switch_not_triggered(monkeypatch):
+    # 开了自动换服(auto_switch_server=True)但本次死亡没触发换服(连续短局数没到
+    # limit=2, 第一轮 action=="none") → 死亡位置保留给第二轮避让.
+    stub = _RunWorkerStub(monkeypatch)
+    stub.run()
+    assert stub.auto_farming_calls[0] is None          # 第一轮: 无上一轮死亡位置
+    assert stub.auto_farming_calls[1] == (30, 40)      # 第二轮: 收到第一轮死亡位置
+
+
+def test_run_worker_clears_death_spot_when_switch_fails(monkeypatch):
+    # 开了自动换服、连续短局数到 limit 触发换服, 但 switch_server() 抛异常失败
+    # → 人还在同一台服务器, 死亡位置必须保留(不清), 下一轮继续避让.
+    stub = _RunWorkerStub(monkeypatch, switch_calls=[RuntimeError("换服失败")])
+
+    # 让第一轮就触发换服: 把连续短局数推到 limit=2 之前.
+    # run_worker 内部 consecutive_short_rounds 从 0 开始, 第一轮 action="none";
+    # 手动把 _auto_switch_step 挡到第一轮就返回 switch, 模拟"上一轮已到阈值".
+    real_step = main._auto_switch_step
+
+    def fake_step(round_completed_full, consecutive, auto_switch, limit):
+        if main._stub_force_switch_once:
+            main._stub_force_switch_once = False
+            return "switch", 2
+        return real_step(round_completed_full, consecutive, auto_switch, limit)
+
+    main._stub_force_switch_once = True
+    monkeypatch.setattr(main, "_auto_switch_step", fake_step)
+    stub.run()
+    assert stub.auto_farming_calls[1] == (30, 40)   # 换服失败 → 死亡位置仍传给第二轮
+
+
+def test_run_worker_clears_death_spot_after_successful_switch(monkeypatch):
+    # 换服成功 → 死亡位置清空(另一台服务器, 上一轮死亡位置无意义).
+    stub = _RunWorkerStub(monkeypatch)   # switch_server 不抛异常 = 成功
+    real_step = main._auto_switch_step
+
+    def fake_step(round_completed_full, consecutive, auto_switch, limit):
+        if main._stub_force_switch_once:
+            main._stub_force_switch_once = False
+            return "switch", 2
+        return real_step(round_completed_full, consecutive, auto_switch, limit)
+
+    main._stub_force_switch_once = True
+    monkeypatch.setattr(main, "_auto_switch_step", fake_step)
+    stub.run()
+    assert stub.auto_farming_calls[1] is None   # 换服成功 → 第二轮不避让(新服务器)
+
+
 def test_worker_graceful_exit_resets_keyboard_then_exits(monkeypatch):
     called = []
     monkeypatch.setattr(main, "reset_keyboard", lambda: called.append("reset"))
